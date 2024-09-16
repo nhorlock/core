@@ -18,6 +18,8 @@ from homeassistant.components.sensor import (
 from homeassistant.const import ATTR_LOCATION, PERCENTAGE, EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
+import logging
 from homeassistant.helpers.typing import StateType
 from homeassistant.util.dt import utcnow
 
@@ -34,6 +36,8 @@ from .const import (
     ATTR_URI_SUPPORTED,
 )
 from .entity import IPPEntity
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -129,10 +133,16 @@ async def async_setup_entry(
     async_add_entities(sensors, True)
 
 
-class IPPSensor(IPPEntity, SensorEntity):
+class IPPSensor(IPPEntity, RestoreEntity, SensorEntity):
     """Defines an IPP sensor."""
 
     entity_description: IPPSensorEntityDescription
+
+    def __init__(self, coordinator, description):
+        """Initialize the IPPSensor."""
+        super().__init__(coordinator)
+        self.entity_description = description
+        self._last_known_value = None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -142,4 +152,37 @@ class IPPSensor(IPPEntity, SensorEntity):
     @property
     def native_value(self) -> StateType | datetime:
         """Return the state of the sensor."""
-        return self.entity_description.value_fn(self.coordinator.data)
+        try:
+            value = self.entity_description.value_fn(self.coordinator.data)
+            if self._is_valid_value(value):
+                self._last_known_value = value
+                return value
+            else:
+                _LOGGER.warning(
+                    "Received invalid value '%s' for %s, using last known good value.",
+                    value,
+                    self.entity_description.key,
+                )
+                return self._last_known_value
+        except Exception as ex:
+            _LOGGER.error(
+                "Error retrieving value for %s: %s. Using last known good value.",
+                self.entity_description.key,
+                ex,
+            )
+            return self._last_known_value
+
+    def _is_valid_value(self, value) -> bool:
+        """Validate the sensor value."""
+        if value is None:
+            return False
+        if isinstance(value, (int, float, str, datetime)):
+            return True
+        return False
+
+    async def async_added_to_hass(self):
+        """Restore last known state."""
+        await super().async_added_to_hass()
+        if (last_state := await self.async_get_last_state()) is not None:
+            if self._is_valid_value(last_state.state):
+                self._last_known_value = last_state.state
